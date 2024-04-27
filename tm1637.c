@@ -11,9 +11,12 @@
 #define tm1637_delay_ms(x)  osDelay(x)
 #endif
 
-#define TM1637_COMM1    0x40
-#define TM1637_COMM2    0xC0
-#define TM1637_COMM3    0x80
+#include "cmsis_gcc.h" // for NOP()
+ 
+#define TM1637_COMM1    0x40 // data command (read/write)
+#define TM1637_COMM2    0xC0 // address command
+#define TM1637_COMM3    0x80 // display control
+
 
 const uint8_t _tm1637_digit[] =
   {0x3f, 0x06, 0x5b, 0x4f, 0x66, 0x6d, 0x7d, 0x07, 0x7f, 0x6f};
@@ -26,28 +29,26 @@ const uint8_t _tm1637_dot = 0x80;
 //#######################################################################################################################
 // SYSTEM & Delay
 //#######################################################################################################################
-static inline void __nop(void) {
-  __asm("NOP"); 
-}
+// static inline void __nop(void) {
+//   __asm("NOP"); 
+// }
 
 //#######################################################################################################################
 /**
- * @brief Delays for a specified number of microseconds in a blocking manner.
+ * @brief block delay using NOP and a decrementing counter, actual delay time depends on SYSCLOCK
  * 
- * This function provides a delay in microseconds by executing NOP (No Operation) instructions
- * to consume time. It's a simple and effective way to introduce short delays in the program.
- * The delay mechanism is blocking, meaning it will halt the execution of subsequent code until
- * the delay period has elapsed.
- * 
- * @param delay The number of microseconds to delay.
- * TODO non blocking HAL_Delay implementation
+ * @param delay integer number of cycles/5 to delay
+ * @note will delay for 'delay x 5' SYSCLOCK cycles; t_delay = (delay * 5) / SYSCLOCK
+
+ * Calculation: (delay * 5) / SYSCLOCK
+ * Example: at 72MHz SYSCLOCK clock, delay_us(20) = (20 * 5) / 72E6 = 1.4us
  */
 void tm1637_delay_us(uint8_t delay)
 {
   while (delay > 0)
   {
     delay--;
-    __nop();__nop();__nop();__nop();
+    __NOP(); __NOP(); __NOP(); __NOP(); 
   }
 }
 
@@ -94,34 +95,52 @@ void tm1637_stop(tm1637_t *tm1637)
  * 
  * @param tm1637 Pointer to a tm1637_t structure that contains the configuration information for the display.
  * @param data The data byte to be written.
- * @return uint8_t The acknowledge status of the write operation.
+ * @return uint8_t The acknowledge bit pin state (0=ACK, 1=NACK)
+ * @note 
+ * Data is valild only when clock is HIGH (reset = idle & OD with Rpullup). 
 */
 uint8_t tm1637_write_byte(tm1637_t *tm1637, uint8_t data)
 {
   //  write 8 bit data
   for (uint8_t i = 0; i < 8; i++)
   {
+    // Data can only change while Clock is Low
     HAL_GPIO_WritePin(tm1637->gpio_clk, tm1637->pin_clk, GPIO_PIN_RESET);
-    tm1637_delay_us(_TM1637_BIT_DELAY);
+    tm1637_delay_us(_TM1637_BIT_DELAY); // delay=20 yields 4.3us under testing
+
+    // Shift data out on data pin
     if (data & 0x01)
       HAL_GPIO_WritePin(tm1637->gpio_dat, tm1637->pin_dat, GPIO_PIN_SET);
     else
       HAL_GPIO_WritePin(tm1637->gpio_dat, tm1637->pin_dat, GPIO_PIN_RESET);
+
     tm1637_delay_us(_TM1637_BIT_DELAY);
+
+    // Clock -> HIGH/idle to clock in data
     HAL_GPIO_WritePin(tm1637->gpio_clk, tm1637->pin_clk, GPIO_PIN_SET);
     tm1637_delay_us(_TM1637_BIT_DELAY);
     data = data >> 1;
   }
-  // wait for acknowledge
+
+  // Data transfer finish, wait for ACK
+  // Clock -> Low
   HAL_GPIO_WritePin(tm1637->gpio_clk, tm1637->pin_clk, GPIO_PIN_RESET);
+
+  // Data -> idle
   HAL_GPIO_WritePin(tm1637->gpio_dat, tm1637->pin_dat, GPIO_PIN_SET);
   tm1637_delay_us(_TM1637_BIT_DELAY);
+
+  // Clock -> High to read ACK state
   HAL_GPIO_WritePin(tm1637->gpio_clk, tm1637->pin_clk, GPIO_PIN_SET);
   tm1637_delay_us(_TM1637_BIT_DELAY);
+
   uint8_t ack = HAL_GPIO_ReadPin(tm1637->gpio_dat, tm1637->pin_dat);
-  if (ack == 0)
-    HAL_GPIO_WritePin(tm1637->gpio_dat, tm1637->pin_dat, GPIO_PIN_RESET);
-  tm1637_delay_us(_TM1637_BIT_DELAY);
+  if (ack == 0) // ack == 0 -> ACK // ack == 1 -> NACK
+    HAL_GPIO_WritePin(tm1637->gpio_dat, tm1637->pin_dat, GPIO_PIN_RESET); // If ack pull SDA low to hold ack so we don't come out of data Tx
+
+  tm1637_delay_us(_TM1637_BIT_DELAY); // delay some more, this causes this clock T_high = 2*T_BIT_DELAY
+
+  // Clock -> Low to end transmission
   HAL_GPIO_WritePin(tm1637->gpio_clk, tm1637->pin_clk, GPIO_PIN_RESET);
   tm1637_delay_us(_TM1637_BIT_DELAY);
   return ack;
@@ -136,7 +155,7 @@ uint8_t tm1637_write_byte(tm1637_t *tm1637, uint8_t data)
  * before checking again. This process is repeated until the lock flag is set to 0,
  * indicating that the display is ready for access.
  * 
- * @param tm1637 Pointer to a tm1637_t structure that contains the configuration information for the display.
+ * @param tm1637 Pointer to a tm1637_t structure 
 */
 void tm1637_lock(tm1637_t *tm1637)
 {
@@ -148,9 +167,6 @@ void tm1637_lock(tm1637_t *tm1637)
 //#######################################################################################################################
 /**
  * @brief Unlocks the TM1637 display to allow concurrent access.
- * 
- * This function sets the lock flag to 0, indicating that the display is ready for access.
- * 
  * @param tm1637 Pointer to a tm1637_t structure that contains the configuration information for the display.
 */
 void tm1637_unlock(tm1637_t *tm1637)
@@ -207,23 +223,41 @@ void tm1637_brightness(tm1637_t *tm1637, uint8_t brightness_0_to_7)
 }
 
 //#######################################################################################################################
+
+
+
+/**
+ * @brief Writes raw data to the TM1637 display. LSB first.
+ * 
+ * @param tm1637 Pointer to a tm1637_t structure that contains the configuration information for the display.
+ * @param raw Pointer to an array of uint8_t containing the raw data to be written (LSB first).
+ * @param length The length of the raw data array. Should not exceed 6.
+ * @param pos The 0-indexed position on the display where the first digit from the raw data will be written. 
+ * 
+ * @note updates brightness as stored in tm1637->brightness
+ */
 void tm1637_write_raw(tm1637_t *tm1637, const uint8_t *raw, uint8_t length, uint8_t pos)
 {
   if (pos > 5)
     return;
   if (length > 6)
     length = 6;
-  // write COMM1
+
+  // write COMM1 (write command)
   tm1637_start(tm1637);
   tm1637_write_byte(tm1637, TM1637_COMM1);
   tm1637_stop(tm1637);
-  // write COMM2 + first digit address
+
+  // write COMM2 + first digit address (address command)
   tm1637_start(tm1637);
   tm1637_write_byte(tm1637, TM1637_COMM2 + (pos & 0x03));
-  // write the data bytes
+
+  // write the data bytes 
   for (uint8_t k=0; k < length; k++)
     tm1637_write_byte(tm1637, raw[k]);
+
   tm1637_stop(tm1637);
+
   // write COMM3 + brightness
   tm1637_start(tm1637);
   tm1637_write_byte(tm1637, TM1637_COMM3 + tm1637->brightness);
@@ -232,8 +266,8 @@ void tm1637_write_raw(tm1637_t *tm1637, const uint8_t *raw, uint8_t length, uint
 
 //#######################################################################################################################
 /**
- * Alloss direct control over the segments of the TM1637 display. Each byte in the segments array
- * corresponds to a segment of the display, where the LSB is the A segment and the MSB is the DP (decimal point) segment.
+ * Allows direct control over the segments of the TM1637 display. Each byte in the segments array
+ * corresponds to a segment of the display, where the 0-index is the A segment (LSB) and the 7-index is the DP (decimal point) segment.
  * 
  * @param tm1637 Pointer to a tm1637_t structure that contains the configuration information for the display.
  * @param segments Pointer to an array of uint8_t where each element represents the segments for one digit.
